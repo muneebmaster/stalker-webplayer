@@ -2,7 +2,7 @@ import { Router } from "express";
 import axios from "axios";
 import { RateLimitError, StalkerClient } from "../stalkerClient.js";
 import { createSession, getSession, destroySession, SessionError } from "../sessionStore.js";
-import { epgCacheGet, epgCacheSet } from "../epgCache.js";
+import { epgCacheGet, epgCacheGetAny, epgCacheSet, mergePrograms } from "../epgCache.js";
 import type { StalkerCredentials } from "../types.js";
 
 const router = Router();
@@ -95,12 +95,15 @@ router.post("/connect", async (req, res) => {
     };
     const candidateClient = new StalkerClient(credentials);
     try {
-      await candidateClient.handshake(true); // probe=true: no 429 retries
+      await candidateClient.handshake(true); // probe: patient on 429, fail-fast on wrong-path errors
       client = candidateClient;
       matchedUrl = candidate;
       break;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
+      // The probe already rode out 429s with backoff; a RateLimitError here
+      // means the portal is still throttling after retries. Stop probing
+      // further candidates (they'd be throttled too) and surface it below.
       if (err instanceof RateLimitError) break;
     }
   }
@@ -121,6 +124,7 @@ router.post("/connect", async (req, res) => {
   }
 
   // Stage 2: fully verify and establish the session on the matched candidate.
+  // The probe already obtained a valid token on this client, so we reuse it.
   try {
     if (login && password) {
       await client.authenticate();
@@ -191,15 +195,24 @@ router.get("/epg/:channelId", async (req, res) => {
   try {
     const client = getSession(getSessionId(req));
     const channelId = req.params.channelId;
-    const limit = req.query.limit ? Number(req.query.limit) : 8;
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 12));
+    // refresh=1 forces a re-fetch from the portal (bypassing the freshness
+    // cache) and merges the result into what's stored, so the EPG grid can
+    // backfill future slots as its time window slides forward.
+    const refresh = req.query.refresh === "1";
 
-    const cached = epgCacheGet(client.portalHost, channelId);
-    if (cached) {
-      res.json({ programs: cached });
-      return;
+    if (!refresh) {
+      const cached = epgCacheGet(client.portalHost, channelId);
+      if (cached) {
+        res.json({ programs: cached });
+        return;
+      }
     }
 
-    const programs = await client.getShortEpg(channelId, limit);
+    const fresh = await client.getShortEpg(channelId, limit);
+    const programs = refresh
+      ? mergePrograms(epgCacheGetAny(client.portalHost, channelId) ?? [], fresh)
+      : fresh;
     if (programs.length > 0) {
       epgCacheSet(client.portalHost, channelId, programs);
     }

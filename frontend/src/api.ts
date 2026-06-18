@@ -36,8 +36,11 @@ async function request<T>(
 }
 
 export function connect(credentials: StalkerCredentials): Promise<ConnectionResult> {
+  // Generous timeout: the backend rides out portal rate-limit (429) windows
+  // with patient exponential backoff across the handshake/auth sequence, which
+  // can legitimately take ~1 minute. Abort only well past that.
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 60_000);
+  const timer = setTimeout(() => ac.abort(), 120_000);
   return request<ConnectionResult>("/api/connect", {
     method: "POST",
     body: JSON.stringify(credentials),
@@ -62,10 +65,12 @@ export async function getChannels(sessionId: string): Promise<Channel[]> {
 export async function getEpg(
   sessionId: string,
   channelId: string,
-  limit = 8
+  options: { limit?: number; refresh?: boolean } = {}
 ): Promise<EpgProgram[]> {
+  const { limit = 12, refresh = false } = options;
+  const query = `limit=${limit}${refresh ? "&refresh=1" : ""}`;
   const data = await request<{ programs: EpgProgram[] }>(
-    `/api/epg/${encodeURIComponent(channelId)}?limit=${limit}`,
+    `/api/epg/${encodeURIComponent(channelId)}?${query}`,
     { sessionId }
   );
   return data.programs;
