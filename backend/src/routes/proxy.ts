@@ -1,10 +1,55 @@
 import { Router } from "express";
-import axios from "axios";
+import axios, { AxiosResponse } from "axios";
 
 const router = Router();
 
 const STREAM_USER_AGENT =
   "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 250 Mobile Safari/533.3";
+
+// Transient upstream failures (CDN hiccups, load-balancer blips) on the first
+// manifest fetch are a common cause of hls.js "manifestLoadError" right after a
+// channel switch. Retry the manifest fetch a few times with short backoff so
+// these never reach the player.
+const MANIFEST_MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 300;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Server-side errors and throttling are worth retrying; 4xx (bad URL/auth) is not. */
+function isRetryableStatus(status: number): boolean {
+  return status >= 500 || status === 429 || status === 408;
+}
+
+/** Fetch an HLS manifest, retrying transient network errors / 5xx responses. */
+async function fetchManifest(target: string): Promise<AxiosResponse<string>> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= MANIFEST_MAX_RETRIES; attempt++) {
+    try {
+      const upstream = await axios.get<string>(target, {
+        responseType: "text",
+        timeout: 20000,
+        headers: { "User-Agent": STREAM_USER_AGENT, Accept: "*/*" },
+        validateStatus: () => true,
+      });
+      if (isRetryableStatus(upstream.status) && attempt < MANIFEST_MAX_RETRIES) {
+        console.log(`[proxy/m3u8] ${upstream.status} (attempt ${attempt + 1}/${MANIFEST_MAX_RETRIES + 1}) — retrying ${target.slice(0, 120)}`);
+        await sleep(RETRY_DELAY_MS * (attempt + 1));
+        continue;
+      }
+      return upstream;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MANIFEST_MAX_RETRIES) {
+        console.log(`[proxy/m3u8] error (attempt ${attempt + 1}/${MANIFEST_MAX_RETRIES + 1}) — retrying: ${err instanceof Error ? err.message : String(err)}`);
+        await sleep(RETRY_DELAY_MS * (attempt + 1));
+        continue;
+      }
+    }
+  }
+  throw lastErr;
+}
 
 function proxiedUrl(req: import("express").Request, kind: "m3u8" | "segment", target: string): string {
   const base = `${req.protocol}://${req.get("host")}`;
@@ -31,12 +76,7 @@ router.get("/m3u8", async (req, res) => {
   }
 
   try {
-    const upstream = await axios.get<string>(target, {
-      responseType: "text",
-      timeout: 20000,
-      headers: { "User-Agent": STREAM_USER_AGENT, Accept: "*/*" },
-      validateStatus: () => true,
-    });
+    const upstream = await fetchManifest(target);
 
     if (upstream.status >= 400) {
       console.log(`[proxy/m3u8] ${upstream.status} <- ${target.slice(0, 200)}`);
@@ -44,7 +84,10 @@ router.get("/m3u8", async (req, res) => {
       return;
     }
 
-    const base = new URL(target);
+    // Rewrite relative to the final URL (after any redirects), so segment and
+    // variant URIs resolve correctly even when the manifest redirects hosts.
+    const finalUrl: string = upstream.request?.res?.responseUrl ?? target;
+    const base = new URL(finalUrl);
     const rewritten = upstream.data
       .split("\n")
       .map((line) => {

@@ -273,6 +273,26 @@ export class StalkerClient {
     }
 
     const body = res.data;
+
+    // ---- "Authorization failed." — expired token returned as an HTML page ----
+    // When the session token lapses mid-session the portal often replies with
+    // an HTML "Authorization failed." page (HTTP 200, text/html) instead of a
+    // JSON js:false response. Treat it the same: re-authenticate and retry so
+    // the failure stays invisible to the user (e.g. on the next channel switch).
+    if (typeof body === "string" && /authorization failed/i.test(body)) {
+      const tokenAgeS = this.tokenIssuedAt ? Math.round((Date.now() - this.tokenIssuedAt) / 1000) : "never";
+      this.log(
+        `"Authorization failed" on ${params.type}.${params.action} ` +
+        `(token age: ${tokenAgeS}s, isReAuth: ${isReAuth}, attempt: ${attempt})`
+      );
+      const retry = await this.maybeReauthAndRetry<T>(params, attempt, isReAuth, maxRLRetries, priority, "Authorization failed");
+      if (retry.retried) return retry.value;
+      throw new Error(
+        `Portal rejected action "${params.action}" with "Authorization failed" (token age: ${tokenAgeS}s). ` +
+        `The session token is no longer valid.`
+      );
+    }
+
     if (body == null || typeof body !== "object" || !("js" in body)) {
       const contentType = res.headers["content-type"];
       const bodySnippet = typeof body === "string"
@@ -293,21 +313,8 @@ export class StalkerClient {
         `(token age: ${tokenAgeS}s, isReAuth: ${isReAuth}, attempt: ${attempt})`
       );
 
-      // Only re-auth for specific actions where a rejected token is a real
-      // problem (create_link, get_ordered_list). Discovery calls returning
-      // js:false just means the portal doesn't support the feature.
-      const reauthKey = `${params.type}.${params.action}`;
-      if (!isReAuth && REAUTH_ELIGIBLE_KEYS.has(reauthKey) && attempt < MAX_AUTH_RETRIES) {
-        this.log("Token rejected — attempting re-authentication (handshake + get_profile)");
-        try {
-          await this.reAuthDirect();
-          this.log("Re-authentication succeeded — retrying original request");
-          return this.executeCall<T>(params, attempt + 1, false, maxRLRetries, priority);
-        } catch (reAuthErr) {
-          this.log(`Re-authentication failed: ${reAuthErr instanceof Error ? reAuthErr.message : String(reAuthErr)}`);
-          // Fall through to throw the original error
-        }
-      }
+      const retry = await this.maybeReauthAndRetry<T>(params, attempt, isReAuth, maxRLRetries, priority, `js=${JSON.stringify(body.js)}`);
+      if (retry.retried) return retry.value;
 
       throw new Error(
         `Portal rejected action "${params.action}" (js: ${JSON.stringify(body.js)}, token age: ${tokenAgeS}s). ` +
@@ -316,6 +323,37 @@ export class StalkerClient {
     }
 
     return (body as { js: T }).js;
+  }
+
+  /**
+   * Transparently re-authenticate (handshake + get_profile) and retry the
+   * original call when the portal rejects a stale token. Eligible only for
+   * actions where a rejected token is a real problem (not feature-probe calls),
+   * bounded by MAX_AUTH_RETRIES, and skipped while already re-authenticating.
+   * Returns the retried result, or `{ retried: false }` if no retry was made.
+   */
+  private async maybeReauthAndRetry<T>(
+    params: Record<string, string | number>,
+    attempt: number,
+    isReAuth: boolean,
+    maxRLRetries: number,
+    priority: "critical" | "background",
+    trigger: string
+  ): Promise<{ retried: true; value: T } | { retried: false }> {
+    const reauthKey = `${params.type}.${params.action}`;
+    if (isReAuth || !REAUTH_ELIGIBLE_KEYS.has(reauthKey) || attempt >= MAX_AUTH_RETRIES) {
+      return { retried: false };
+    }
+    this.log(`${trigger} on ${reauthKey} — attempting re-authentication (handshake + get_profile)`);
+    try {
+      await this.reAuthDirect();
+      this.log("Re-authentication succeeded — retrying original request");
+      const value = await this.executeCall<T>(params, attempt + 1, false, maxRLRetries, priority);
+      return { retried: true, value };
+    } catch (reAuthErr) {
+      this.log(`Re-authentication failed: ${reAuthErr instanceof Error ? reAuthErr.message : String(reAuthErr)}`);
+      return { retried: false };
+    }
   }
 
   /**
