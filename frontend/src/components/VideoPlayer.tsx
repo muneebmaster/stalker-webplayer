@@ -21,13 +21,9 @@ function resolutionLabel(height: number): string {
   return "SD";
 }
 
-function audioLabel(channels: number): string {
-  return channels >= 6 ? "5.1" : "Stereo";
-}
-
-function audioLabelFromCodec(codec: string | undefined): string {
-  if (codec && /^(ec-3|ac-3)/i.test(codec)) return "5.1";
-  return "Stereo";
+function fpsLabel(rate: number): string | null {
+  if (!Number.isFinite(rate) || rate <= 0) return null;
+  return `${Math.round(rate)} FPS`;
 }
 
 function formatDuration(seconds: number): string {
@@ -105,7 +101,7 @@ export default function VideoPlayer({ src, channel, loading, resolveError, strea
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
   const [resolution, setResolution] = useState<string | null>(null);
-  const [audio, setAudio] = useState<string | null>(null);
+  const [fps, setFps] = useState<string | null>(null);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [showOverlay, setShowOverlay] = useState(false);
@@ -144,7 +140,7 @@ export default function VideoPlayer({ src, channel, loading, resolveError, strea
 
     setError(null);
     setResolution(null);
-    setAudio(null);
+    setFps(null);
     setDuration(0);
     setCurrentTime(0);
 
@@ -188,15 +184,12 @@ export default function VideoPlayer({ src, channel, loading, resolveError, strea
       hls.on(Hls.Events.LEVEL_SWITCHED, (_evt, data) => {
         const level = hls.levels[data.level];
         if (level?.height) setResolution(resolutionLabel(level.height));
-        setAudio((prev) => prev ?? audioLabelFromCodec(level?.audioCodec));
+        // Instant hint from the manifest's FRAME-RATE attribute; the
+        // requestVideoFrameCallback measurement below refines/overrides it.
+        const rate = Number(level?.frameRate ?? level?.attrs?.["FRAME-RATE"]);
+        const label = fpsLabel(rate);
+        if (label) setFps((prev) => prev ?? label);
       });
-      const updateAudioTrack = () => {
-        const track = hls.audioTracks[hls.audioTrack] as { attrs?: Record<string, string> } | undefined;
-        const channels = Number(track?.attrs?.CHANNELS);
-        if (Number.isFinite(channels) && channels > 0) setAudio(audioLabel(channels));
-      };
-      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, updateAudioTrack);
-      hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, updateAudioTrack);
       video.play().catch(() => {});
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
       video.src = src;
@@ -231,6 +224,28 @@ export default function VideoPlayer({ src, channel, loading, resolveError, strea
       video.removeEventListener("durationchange", onDuration);
       video.removeEventListener("timeupdate", onTime);
     };
+  }, [src]);
+
+  // Measure the actual displayed frame rate via requestVideoFrameCallback.
+  // Works uniformly for HLS and direct files; samples ~1s of media time per
+  // reading and snaps to the nearest whole FPS (e.g. 23.976 → 24, 59.94 → 60).
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !src || typeof video.requestVideoFrameCallback !== "function") return;
+    let handle = 0;
+    let anchor: { time: number; frames: number } | null = null;
+    const onFrame = (_now: number, meta: VideoFrameCallbackMetadata) => {
+      if (anchor && meta.mediaTime - anchor.time >= 1) {
+        const label = fpsLabel((meta.presentedFrames - anchor.frames) / (meta.mediaTime - anchor.time));
+        if (label) setFps(label);
+        anchor = { time: meta.mediaTime, frames: meta.presentedFrames };
+      } else if (!anchor) {
+        anchor = { time: meta.mediaTime, frames: meta.presentedFrames };
+      }
+      handle = video.requestVideoFrameCallback(onFrame);
+    };
+    handle = video.requestVideoFrameCallback(onFrame);
+    return () => video.cancelVideoFrameCallback(handle);
   }, [src]);
 
   useEffect(() => {
@@ -287,6 +302,7 @@ export default function VideoPlayer({ src, channel, loading, resolveError, strea
   }, []);
 
   const controlsVisible = showOverlay || !playing;
+  const isLive = channel !== null;
 
   return (
     <div
@@ -303,15 +319,15 @@ export default function VideoPlayer({ src, channel, loading, resolveError, strea
       {(error || resolveError) && <div className="player-error">{error ?? resolveError}</div>}
       {src && !error && !resolveError && (
         <>
-          {overlaysEnabled && controlsVisible && (resolution || audio || channel) && (
+          {overlaysEnabled && controlsVisible && (resolution || fps || channel) && (
             <div className="player-badges">
               {channel && <span className="player-badge live">LIVE</span>}
               {resolution && <span className="player-badge">{resolution}</span>}
-              {audio && <span className="player-badge">{audio}</span>}
+              {fps && <span className="player-badge">{fps}</span>}
             </div>
           )}
           <div className={`player-controls${controlsVisible ? " visible" : ""}`}>
-            {Number.isFinite(duration) && duration > 0 && (
+            {!isLive && Number.isFinite(duration) && duration > 0 && (
               <div className="player-seek-row">
                 <input
                   className="seek-bar"
