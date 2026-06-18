@@ -13,27 +13,38 @@ Full-stack app:
 
 ## Features
 
-- **Live TV** with a scrollable 6-hour EPG grid, live-now indicator, and lazy
-  EPG loading per row as it scrolls into view
-- **EPG cache** backed by SQLite — EPG data is cached locally and reused for
-  up to 12 hours (configurable), dramatically reducing portal requests
+- **Live TV** with a scrollable 24-hour EPG grid and live-now indicator. EPG
+  loads lazily per row as it scrolls into view, and backfills further into the
+  future on demand as you scroll the timeline ahead (e.g. to tonight's
+  schedule)
+- **Player tuned per content type** — live streams show resolution and
+  framerate overlays and have no seek bar; VOD and series play with a seek bar
+- **EPG cache** backed by SQLite — EPG is cached locally and reused for up to
+  12 hours (configurable); coverage grows as newer data is fetched and merged,
+  dramatically reducing portal requests
 - **VOD** and **Series** browsing with category filtering and pagination
 - **Saved profiles** — store portal URL + MAC + credentials under a name,
   switch between providers in one click; profiles are matched on both URL and
-  MAC address so the same portal with different MACs is treated as separate
-- **Favourites** — star channels for quick access; pinned to the top of the
-  channel list
+  MAC address so the same portal with different MACs is treated as separate.
+  Each profile also remembers your sort order, selected category, and
+  last-watched channel, all restored on reconnect
+- **Favourites** — star channels for quick access, pinned to the top of the
+  channel list; keyed by channel number + name so duplicate listings of the
+  same channel are tracked independently
+- **Backup** — export saved profiles and favourites to a JSON file and import
+  them back, merging without creating duplicates
 - **Resizable channel column** — drag the separator between the channel list
   and the EPG timeline; width persists across page reloads
 - **Sort** channels by number or name
 - Emulates a **MAG424** set-top box (metrics payload, SHA1 device fingerprint,
   correct `api_signature`) for broad portal compatibility
-- **Exponential backoff** on HTTP 429 rate-limit responses, with a separate
-  fast-fail probe mode during initial URL discovery to avoid hammering
-  Cloudflare-protected portals
-- Two-queue request scheduling: stream creation (latency-sensitive) runs on a
-  critical queue; EPG and catalogue calls run on a background queue, so
-  switching channels is never delayed by an in-flight EPG fetch
+- **Resilient connect** — patient exponential backoff on HTTP 429 rate-limit
+  responses rides out Cloudflare rate-limit windows during connect and stream
+  resolution; URL-discovery probes stay patient on 429 but fail fast on
+  wrong-path errors, so the correct API path is still found quickly
+- **Playback-first request scheduling** — stream creation and auth run on a
+  critical queue; EPG and catalogue calls run on a background queue that yields
+  to critical work, so switching channels is never stuck behind EPG fetches
 - **HLS proxy** rewrites playlists and segment/key URLs through the backend so
   the browser never needs CORS headers or special upstream authentication
 
@@ -45,32 +56,39 @@ Full-stack app:
 
 ## Setup
 
-```powershell
+Install dependencies for both apps:
+
+```bash
 cd backend && npm install
 cd ../frontend && npm install
 ```
 
-Copy the env files (defaults work for local development):
+Copy the env files (defaults work for local development). On macOS/Linux:
+
+```bash
+cp backend/.env.example backend/.env
+cp frontend/.env.example frontend/.env
+```
+
+On Windows (PowerShell):
 
 ```powershell
-cd ../backend
-copy .env.example .env
-cd ../frontend
-copy .env.example .env
+copy backend\.env.example backend\.env
+copy frontend\.env.example frontend\.env
 ```
 
 ## Running
 
 Start the backend (default port 4000):
 
-```powershell
+```bash
 cd backend
 npm run dev
 ```
 
-Start the frontend (default port 5173):
+Start the frontend (default port 5173) in a second terminal:
 
-```powershell
+```bash
 cd frontend
 npm run dev
 ```
@@ -99,7 +117,7 @@ Open [http://localhost:5173](http://localhost:5173) and enter your portal detail
 | `POST /api/connect` | Handshake, optional `do_auth`, `get_profile`; returns `sessionId` |
 | `GET /api/genres` | Channel genre/category list |
 | `GET /api/channels` | Full channel list with logos |
-| `GET /api/epg/:channelId` | Short EPG for one channel (cached) |
+| `GET /api/epg/:channelId?limit=&refresh=` | Short EPG for one channel (cached; `refresh=1` re-fetches and merges to extend coverage) |
 | `GET /api/stream?cmd=` | Resolve channel stream URL via `create_link` |
 | `GET /api/vod/categories` | VOD category list |
 | `GET /api/vod/list?categoryId=&page=&limit=` | VOD items |
@@ -121,7 +139,9 @@ Backend environment variables (set in `backend/.env`):
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `4000` | Backend server port |
+| `CORS_ORIGIN` | `http://localhost:5173` | Comma-separated origins allowed to call the API |
 | `EPG_STALENESS_HOURS` | `12` | How long EPG cache entries are considered fresh |
+| `RATE_LIMIT_MAX_RETRIES` | `7` | Max HTTP 429 retry attempts (with exponential backoff) for connect/stream requests |
 
 EPG cache is stored as a SQLite database at `data/epg-cache.db` (relative to
 the project root, created automatically on first run).
