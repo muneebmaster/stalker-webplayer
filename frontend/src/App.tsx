@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import LoginScreen from "./components/LoginScreen";
 import TopBar, { type AppMode } from "./components/TopBar";
 import GenreSidebar, { ALL_GENRE_ID, FAVOURITES_GENRE_ID } from "./components/GenreSidebar";
@@ -21,6 +21,7 @@ import { findCurrentProgram, findNextProgram, useEpgCache } from "./hooks/useEpg
 import { useNow } from "./hooks/useNow";
 import { useProfiles } from "./hooks/useProfiles";
 import { useFavourites } from "./hooks/useFavourites";
+import { downloadBackup, readBackup } from "./backup";
 import type {
   Channel,
   ConnectionResult,
@@ -40,9 +41,17 @@ function portalHost(url: string): string {
   try { return new URL(url).host; } catch { return url; }
 }
 
+/** Identify a saved profile by MAC + portal host (the same pairing the app
+ *  uses elsewhere to treat one portal+MAC combination as a single profile). */
+function profileMatches(p: Profile, mac: string, url: string): boolean {
+  const macMatch = p.mac.toLowerCase() === mac.toLowerCase();
+  try { return macMatch && new URL(p.portalUrl).host === new URL(url).host; }
+  catch { return macMatch && p.portalUrl === url; }
+}
+
 export default function App() {
-  const { profiles, saveProfile, deleteProfile } = useProfiles();
-  const { isFavourite, toggleFavourite, favourites } = useFavourites();
+  const { profiles, saveProfile, deleteProfile, importProfiles, updateProfile } = useProfiles();
+  const { isFavourite, toggleFavourite, favourites, importFavourites } = useFavourites();
 
   const [session, setSession] = useState<ConnectionResult | null>(null);
   const [autoConnecting, setAutoConnecting] = useState(false);
@@ -72,6 +81,9 @@ export default function App() {
   const now = useNow();
   const { cache: epgCache, ensureLoaded: ensureEpgLoaded } = useEpgCache(session?.sessionId ?? null);
 
+  // Channel id to auto-select once channels load (restored from a profile).
+  const pendingChannelIdRef = useRef<string | null>(null);
+
   const handleConnect = useCallback(async (credentials: StalkerCredentials, saveAs?: string) => {
     setConnectLoading(true);
     setConnectError(null);
@@ -84,11 +96,18 @@ export default function App() {
       setSession(result);
       setGenres(genreList);
       setChannels(channelList);
-      setSelectedGenreId(ALL_GENRE_ID);
       setSearchQuery("");
-      setSelectedChannel(null);
       setStreamUrl(null);
       setAppMode("live");
+
+      // Restore per-profile live-TV view state (sort, category, last channel)
+      // if we're reconnecting to a saved profile. The channel is selected by
+      // the auto-play effect below, once session + channels are in state.
+      const saved = profiles.find((p) => profileMatches(p, result.mac, result.portalUrl));
+      setEpgSortMode(saved?.sortMode ?? "number");
+      setSelectedGenreId(saved?.lastGenreId ?? ALL_GENRE_ID);
+      pendingChannelIdRef.current = saved?.lastChannelId ?? null;
+      setSelectedChannel(null);
 
       // Save profile with the resolved portal URL (matchedUrl from backend),
       // not the user-typed URL, so future reconnects skip candidate probing.
@@ -109,7 +128,7 @@ export default function App() {
       setConnectLoading(false);
       setAutoConnecting(false);
     }
-  }, [saveProfile]);
+  }, [saveProfile, profiles]);
 
   const resetPlayer = useCallback(() => {
     setSelectedChannel(null);
@@ -207,8 +226,26 @@ export default function App() {
   );
 
   const favouriteChannels = useMemo(
-    () => channels.filter((c) => isFavourite(c.name)),
+    () => channels.filter((c) => isFavourite(c)),
     [channels, isFavourite, favourites]
+  );
+
+  const handleExportData = useCallback(() => {
+    downloadBackup(profiles, [...favourites]);
+  }, [profiles, favourites]);
+
+  const handleImportData = useCallback(
+    async (file: File) => {
+      const data = await readBackup(file);
+      const addedProfiles = importProfiles(data.profiles);
+      importFavourites(data.favourites);
+      return {
+        addedProfiles,
+        skippedProfiles: data.profiles.length - addedProfiles,
+        favourites: data.favourites.length,
+      };
+    },
+    [importProfiles, importFavourites]
   );
 
   const filteredChannels = useMemo(() => {
@@ -223,12 +260,20 @@ export default function App() {
     return base;
   }, [channels, selectedGenreId, searchQuery, favouriteChannels]);
 
-  // Auto-play first channel when list loads
+  // Restore the last-viewed channel (if any), else auto-play the first in view.
   useEffect(() => {
-    if (appMode === "live" && !selectedChannel && filteredChannels.length > 0) {
-      handleSelectChannel(filteredChannels[0]);
+    if (appMode !== "live" || selectedChannel || channels.length === 0) return;
+    const pendingId = pendingChannelIdRef.current;
+    if (pendingId) {
+      pendingChannelIdRef.current = null;
+      const restored = channels.find((c) => c.id === pendingId);
+      if (restored) {
+        handleSelectChannel(restored);
+        return;
+      }
     }
-  }, [filteredChannels, selectedChannel, handleSelectChannel, appMode]);
+    if (filteredChannels.length > 0) handleSelectChannel(filteredChannels[0]);
+  }, [channels, filteredChannels, selectedChannel, handleSelectChannel, appMode]);
 
   const currentProgram = selectedChannel
     ? findCurrentProgram(epgCache[selectedChannel.id], now)
@@ -263,15 +308,26 @@ export default function App() {
     };
   }, [selectedChannel, playingMedia, currentProgram, nextProgram, now]);
 
-  const currentDisplayName = useMemo(() => {
-    if (!session) return "";
-    const match = profiles.find((p) => {
-      const macMatch = p.mac.toLowerCase() === session.mac.toLowerCase();
-      try { return macMatch && new URL(p.portalUrl).host === new URL(session.portalUrl).host; }
-      catch { return macMatch && p.portalUrl === session.portalUrl; }
+  const currentProfile = useMemo(
+    () => (session ? profiles.find((p) => profileMatches(p, session.mac, session.portalUrl)) ?? null : null),
+    [session, profiles]
+  );
+  const currentProfileId = currentProfile?.id ?? null;
+  const currentDisplayName = session ? (currentProfile?.name ?? portalHost(session.portalUrl)) : "";
+
+  // Persist live-TV view state (sort, category, last channel) back to the
+  // active profile so it's restored on the next reconnect. Keyed on the
+  // profile id (a stable string) to avoid a write→re-render→write loop.
+  useEffect(() => {
+    if (appMode !== "live" || !currentProfileId) return;
+    updateProfile(currentProfileId, {
+      sortMode: epgSortMode,
+      lastGenreId: selectedGenreId,
+      // Only record a channel when one is selected, so the saved value isn't
+      // wiped during the brief no-selection window while reconnecting.
+      ...(selectedChannel ? { lastChannelId: selectedChannel.id } : {}),
     });
-    return match?.name ?? portalHost(session.portalUrl);
-  }, [session, profiles]);
+  }, [appMode, currentProfileId, epgSortMode, selectedGenreId, selectedChannel, updateProfile]);
 
   const sidebarCategories = appMode === "vod"
     ? (vodSubMode === "series" ? seriesCategories : vodCategories)
@@ -292,6 +348,9 @@ export default function App() {
         profiles={profiles}
         onSaveProfile={saveProfile}
         onDeleteProfile={deleteProfile}
+        onExportData={handleExportData}
+        onImportData={handleImportData}
+        hasData={profiles.length > 0 || favourites.size > 0}
       />
     );
   }

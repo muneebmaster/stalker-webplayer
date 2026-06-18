@@ -15,7 +15,13 @@ import type {
 const USER_AGENT =
   "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3";
 
-const MAX_RATE_LIMIT_RETRIES = 3;
+// Rate-limit (HTTP 429) retry budgets. Critical work (connect handshake/auth
+// and stream creation) is retried patiently so a transient Cloudflare
+// rate-limit window — which can last tens of seconds — is ridden out rather
+// than surfaced to the user as a connect failure. Background work (EPG,
+// catalogue) retries only a little so a backlog never piles up behind it.
+const MAX_RATE_LIMIT_RETRIES_CRITICAL = Number(process.env.RATE_LIMIT_MAX_RETRIES ?? 7);
+const MAX_RATE_LIMIT_RETRIES_BACKGROUND = 2;
 const MAX_AUTH_RETRIES = 1;
 
 // Re-authenticate only for specific type.action pairs where js:false means
@@ -38,8 +44,9 @@ function jitter(maxMs: number): number {
 }
 
 function exponentialBackoffMs(attempt: number): number {
-  // 1s, 2s, 4s — cap at 8s, plus up to 500ms of jitter.
-  return Math.min(8000, 1000 * Math.pow(2, attempt)) + jitter(500);
+  // 1s, 2s, 4s, 8s, 15s… — cap at 15s, plus up to 1s of jitter. Across the
+  // critical retry budget this rides out a rate-limit window of ~1 minute.
+  return Math.min(15000, 1000 * Math.pow(2, attempt)) + jitter(1000);
 }
 
 function deriveSerial(mac: string): string {
@@ -80,6 +87,9 @@ export class StalkerClient {
   private criticalQueue: Promise<void> = Promise.resolve();
   // Background queue: EPG, channel list, categories — runs independently.
   private backgroundQueue: Promise<void> = Promise.resolve();
+  // Count of critical (playback/token) requests queued or in flight. Background
+  // requests yield while this is > 0 so stream creation always wins the portal.
+  private pendingCritical = 0;
 
   constructor(private readonly credentials: StalkerCredentials) {
     this.mac = credentials.mac;
@@ -145,6 +155,9 @@ export class StalkerClient {
   private async call<T = unknown>(
     params: Record<string, string | number>
   ): Promise<T> {
+    // Mark a critical request as pending immediately (even before it reaches
+    // the head of its own queue) so in-flight background calls start yielding.
+    this.pendingCritical++;
     const previous = this.criticalQueue;
     let release: () => void;
     this.criticalQueue = new Promise<void>((resolve) => { release = resolve; });
@@ -152,11 +165,12 @@ export class StalkerClient {
     try {
       return await this.executeCall<T>(params, 0, false);
     } finally {
+      this.pendingCritical--;
       release!();
     }
   }
 
-  /** Background queue: EPG, channel list, categories. Runs concurrently with critical. */
+  /** Background queue: EPG, channel list, categories. Yields to critical work. */
   private async callBg<T = unknown>(
     params: Record<string, string | number>
   ): Promise<T> {
@@ -165,7 +179,7 @@ export class StalkerClient {
     this.backgroundQueue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
-      return await this.executeCall<T>(params, 0, false);
+      return await this.executeCall<T>(params, 0, false, MAX_RATE_LIMIT_RETRIES_BACKGROUND, "background");
     } finally {
       release!();
     }
@@ -182,8 +196,20 @@ export class StalkerClient {
     params: Record<string, string | number>,
     attempt: number,
     isReAuth: boolean,
-    maxRLRetries = MAX_RATE_LIMIT_RETRIES
+    maxRLRetries = MAX_RATE_LIMIT_RETRIES_CRITICAL,
+    priority: "critical" | "background" = "critical"
   ): Promise<T> {
+    // Playback takes absolute priority. A background call (EPG, catalogue)
+    // never occupies the portal while a stream-creation or token request is
+    // queued or in flight — it yields until the critical queue drains, so a
+    // channel switch is never stuck behind a backlog of EPG fetches. At worst
+    // a critical call waits on the single background request already in flight.
+    if (priority === "background") {
+      while (this.pendingCritical > 0) {
+        await this.criticalQueue;
+      }
+    }
+
     // Respect the class-level rate-limit cooldown before throttle math.
     const cooldownWait = this.rateLimitCooldownUntil - Date.now();
     if (cooldownWait > 0) {
@@ -220,7 +246,7 @@ export class StalkerClient {
         this.rateLimitCooldownUntil = Date.now() + backoffMs;
         this.log(`429 on ${params.type}.${params.action} — backoff ${backoffMs}ms (attempt ${attempt + 1}/${maxRLRetries})`);
         await delay(backoffMs);
-        return this.executeCall<T>(params, attempt + 1, isReAuth, maxRLRetries);
+        return this.executeCall<T>(params, attempt + 1, isReAuth, maxRLRetries, priority);
       }
 
       const server = res.headers["server"];
@@ -235,8 +261,9 @@ export class StalkerClient {
       ].filter(Boolean).join(", ");
 
       throw new RateLimitError(
-        `Portal is rate-limiting requests (HTTP 429) for action "${params.action}" after ${MAX_RATE_LIMIT_RETRIES} retries. ` +
-        `Wait before reconnecting, and avoid clicking Connect repeatedly.` +
+        `The portal is temporarily rate-limiting requests (HTTP 429) and did not recover after ` +
+        `${maxRLRetries} retries with exponential backoff (action "${params.action}"). ` +
+        `This is usually Cloudflare protection — please wait a minute or two and try again.` +
         (diagnostics ? ` [${diagnostics}]` : "")
       );
     }
@@ -275,7 +302,7 @@ export class StalkerClient {
         try {
           await this.reAuthDirect();
           this.log("Re-authentication succeeded — retrying original request");
-          return this.executeCall<T>(params, attempt + 1, false);
+          return this.executeCall<T>(params, attempt + 1, false, maxRLRetries, priority);
         } catch (reAuthErr) {
           this.log(`Re-authentication failed: ${reAuthErr instanceof Error ? reAuthErr.message : String(reAuthErr)}`);
           // Fall through to throw the original error
@@ -364,10 +391,13 @@ export class StalkerClient {
    *  Pass probe=true during candidate URL discovery to skip 429 retries. */
   async handshake(probe = false): Promise<void> {
     const params = { type: "stb", action: "handshake", token: "" } as const;
-    // In probe mode bypass the queue and skip 429 retries — fail fast so
-    // Cloudflare doesn't see a flood of retry attempts during URL discovery.
+    // During URL discovery (probe) we bypass the queue but still ride out 429
+    // rate-limiting with backoff. A wrong path returns a non-429 error (e.g.
+    // 404) which is NOT retried, so the next candidate is tried immediately —
+    // this prevents a transient rate-limit from being mistaken for the right
+    // (or wrong) path.
     const js = probe
-      ? await this.executeCall<{ token: string }>(params, 0, false, 0)
+      ? await this.executeCall<{ token: string }>(params, 0, false, MAX_RATE_LIMIT_RETRIES_CRITICAL)
       : await this.call<{ token: string }>(params);
     if (!js?.token) {
       throw new Error("Handshake failed: portal did not return a token.");
@@ -473,7 +503,7 @@ export class StalkerClient {
     return match ? match[1] : resolved;
   }
 
-  async getShortEpg(channelId: string, limit = 8): Promise<EpgProgram[]> {
+  async getShortEpg(channelId: string, limit = 12): Promise<EpgProgram[]> {
     await this.ensureToken();
     const js = await this.callBg<Array<Record<string, unknown>>>({
       type: "itv",

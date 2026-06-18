@@ -1,34 +1,54 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+
+// A row must stay on screen this long before it counts as visible, so rows
+// scrolled past during a fast flick never trigger a portal request.
+const DEFAULT_DWELL_MS = 300;
 
 /**
- * Calls `onVisible` only once an element scrolls near the viewport, rather
- * than immediately on mount. Channel/EPG lists render every row unvirtualized,
- * so firing a per-row fetch on mount means thousands of concurrent requests
- * for large portals, exhausting the browser's connection pool.
+ * Tracks whether an element is (and stays) near the viewport. Returns a ref to
+ * attach and a `visible` flag. Channel/EPG lists render every row unvirtualized,
+ * so callers use `visible` to fetch EPG only for rows actually on screen — and
+ * to re-fetch as the visible time window changes — rather than firing a request
+ * for every row the instant it mounts.
  */
-export function useVisibilityEffect<T extends Element>(onVisible: () => void) {
+export function useVisibilityEffect<T extends Element>(dwellMs = DEFAULT_DWELL_MS) {
   const ref = useRef<T | null>(null);
-  const callbackRef = useRef(onVisible);
-  callbackRef.current = onVisible;
+  const [visible, setVisible] = useState(false);
 
   useEffect(() => {
     const el = ref.current;
     if (!el || typeof IntersectionObserver === "undefined") {
-      callbackRef.current();
+      setVisible(true);
       return;
     }
 
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          callbackRef.current();
+        const intersecting = entries.some((entry) => entry.isIntersecting);
+        if (intersecting) {
+          if (timer == null) {
+            timer = setTimeout(() => {
+              timer = null;
+              setVisible(true);
+            }, dwellMs);
+          }
+        } else {
+          if (timer != null) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          setVisible(false);
         }
       },
-      { rootMargin: "600px 0px" }
+      { rootMargin: "150px 0px" }
     );
     observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
+    return () => {
+      if (timer != null) clearTimeout(timer);
+      observer.disconnect();
+    };
+  }, [dwellMs]);
 
-  return ref;
+  return { ref, visible };
 }

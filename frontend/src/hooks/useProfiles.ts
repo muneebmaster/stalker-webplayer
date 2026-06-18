@@ -42,5 +42,19 @@ export function useProfiles() {
     setProfiles(next);
   }, []);
 
-  return { profiles, saveProfile, updateProfile, deleteProfile };
+  // Merge imported profiles into the existing list, skipping any that already
+  // match on portal URL + MAC (the same pair the app uses to identify a
+  // profile) and assigning fresh ids to avoid collisions. Returns how many
+  // were actually added.
+  const importProfiles = useCallback((incoming: Profile[]) => {
+    const existing = load();
+    const seen = new Set(existing.map((p) => `${p.portalUrl}|${p.mac}`.toLowerCase()));
+    const added = incoming.filter((p) => !seen.has(`${p.portalUrl}|${p.mac}`.toLowerCase()));
+    const next = [...existing, ...added.map((p, i) => ({ ...p, id: `${Date.now()}-${i}` }))];
+    save(next);
+    setProfiles(next);
+    return added.length;
+  }, []);
+
+  return { profiles, saveProfile, updateProfile, deleteProfile, importProfiles };
 }

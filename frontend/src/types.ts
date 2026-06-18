@@ -43,6 +43,8 @@ export interface StalkerCredentials {
   deviceId2?: string;
 }
 
+export type EpgSortMode = "number" | "name";
+
 export interface Profile {
   id: string;
   name: string;
@@ -53,6 +55,10 @@ export interface Profile {
   serialNumber?: string;
   deviceId?: string;
   deviceId2?: string;
+  // Per-profile live-TV view state, restored on reconnect.
+  sortMode?: EpgSortMode;
+  lastGenreId?: string;
+  lastChannelId?: string;
 }
 
 export interface VodCategory {

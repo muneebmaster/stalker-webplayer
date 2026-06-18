@@ -1,5 +1,11 @@
-import { FormEvent, useState } from "react";
+import { ChangeEvent, FormEvent, useRef, useState } from "react";
 import type { Profile, StalkerCredentials } from "../types";
+
+interface ImportResult {
+  addedProfiles: number;
+  skippedProfiles: number;
+  favourites: number;
+}
 
 interface Props {
   onConnect: (credentials: StalkerCredentials, saveAs?: string) => Promise<void>;
@@ -8,6 +14,9 @@ interface Props {
   profiles: Profile[];
   onSaveProfile: (profile: Omit<Profile, "id">) => void;
   onDeleteProfile: (id: string) => void;
+  onExportData: () => void;
+  onImportData: (file: File) => Promise<ImportResult>;
+  hasData: boolean;
 }
 
 function portalHost(url: string): string {
@@ -25,7 +34,30 @@ export default function LoginScreen({
   profiles,
   onSaveProfile,
   onDeleteProfile,
+  onExportData,
+  onImportData,
+  hasData,
 }: Props) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importStatus, setImportStatus] = useState<string | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+
+  const handleImportFile = async (e: ChangeEvent<HTMLInputElement>) => {
+    const input = e.currentTarget;
+    const file = input.files?.[0];
+    input.value = ""; // allow re-importing the same file
+    if (!file) return;
+    setImportStatus(null);
+    setImportError(null);
+    try {
+      const result = await onImportData(file);
+      const parts = [`${result.addedProfiles} profile(s)`, `${result.favourites} favourite(s)`];
+      const skipped = result.skippedProfiles > 0 ? ` (${result.skippedProfiles} duplicate profile(s) skipped)` : "";
+      setImportStatus(`Imported ${parts.join(" and ")}${skipped}.`);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : "Import failed.");
+    }
+  };
   const [portalUrl, setPortalUrl] = useState("");
   const [mac, setMac] = useState("");
   const [login, setLogin] = useState("");
@@ -234,6 +266,24 @@ export default function LoginScreen({
           Click a saved profile to connect, or enter details manually. The portal URL is the
           address your provider gave you for MAG/STB devices.
         </p>
+
+        <div className="backup-row">
+          <button type="button" className="backup-btn" onClick={onExportData} disabled={!hasData}>
+            Export profiles &amp; favourites
+          </button>
+          <button type="button" className="backup-btn" onClick={() => fileInputRef.current?.click()}>
+            Import
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: "none" }}
+            onChange={handleImportFile}
+          />
+        </div>
+        {importStatus && <div className="backup-status">{importStatus}</div>}
+        {importError && <div className="login-error">{importError}</div>}
       </div>
     </div>
   );
