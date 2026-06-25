@@ -78,6 +78,12 @@ export class StalkerClient {
   private readonly metricsRandom: string;
   private token: string | null = null;
   private tokenIssuedAt = 0;
+  // Single-flight guard for token acquisition (handshake / re-auth). Concurrent
+  // callers that need a token while one acquisition is in flight await this same
+  // promise instead of each starting their own — without it, a re-auth (which
+  // nulls the token) makes every in-flight request fire its own handshake,
+  // hammering the portal into a self-sustaining 429 rate-limit storm.
+  private tokenOp: Promise<void> | null = null;
   private lastRequestAt = 0;
   // Absolute timestamp until which ALL requests from this client must wait.
   // Set when a 429 is received so queued calls don't immediately hammer the
@@ -346,7 +352,9 @@ export class StalkerClient {
     }
     this.log(`${trigger} on ${reauthKey} — attempting re-authentication (handshake + get_profile)`);
     try {
-      await this.reAuthDirect();
+      // Single-flight: concurrent rejected calls share one re-auth instead of
+      // each running their own handshake (which caused the 429 storm).
+      await this.acquireToken(() => this.reAuthDirect());
       this.log("Re-authentication succeeded — retrying original request");
       const value = await this.executeCall<T>(params, attempt + 1, false, maxRLRetries, priority);
       return { retried: true, value };
@@ -444,12 +452,36 @@ export class StalkerClient {
     this.tokenIssuedAt = Date.now();
   }
 
-  private async ensureToken(): Promise<void> {
-    const TEN_MINUTES = 10 * 60 * 1000;
-    if (!this.token || Date.now() - this.tokenIssuedAt > TEN_MINUTES) {
-      this.log(`Proactive token refresh (age: ${Math.round((Date.now() - this.tokenIssuedAt) / 1000)}s)`);
-      await this.handshake();
+  /**
+   * Run a token-acquisition operation under the single-flight lock. If one is
+   * already in flight, await it instead of starting another. The lock is shared
+   * by proactive refresh (ensureToken) and reactive re-auth so the two can
+   * never overlap and stampede the portal with handshakes.
+   */
+  private acquireToken(op: () => Promise<void>): Promise<void> {
+    if (!this.tokenOp) {
+      this.tokenOp = op().finally(() => { this.tokenOp = null; });
     }
+    return this.tokenOp;
+  }
+
+  private tokenIsFresh(): boolean {
+    const TEN_MINUTES = 10 * 60 * 1000;
+    return this.token !== null && Date.now() - this.tokenIssuedAt <= TEN_MINUTES;
+  }
+
+  private async ensureToken(): Promise<void> {
+    if (this.tokenIsFresh()) return;
+    await this.acquireToken(async () => {
+      // Re-check inside the lock: a concurrent acquisition may have just
+      // refreshed the token while we were waiting to enter.
+      if (this.tokenIsFresh()) return;
+      this.log(`Proactive session refresh (token age: ${Math.round((Date.now() - this.tokenIssuedAt) / 1000)}s)`);
+      // Run the FULL re-establish (handshake + do_auth + get_profile), not a
+      // bare handshake: this portal rejects itv.create_link with "Authorization
+      // failed" on a handshake-only token until get_profile has been called.
+      await this.reAuthDirect();
+    });
   }
 
   /** Optional username/password login step, used by some providers. */
